@@ -1,0 +1,12 @@
+SOLVER:
+  BATCH_SIZE: 64
+  MAX_EPOCH: 20
+  LR: 5e-5
+  SEED: 50
+
+
+DECODER:
+  BINARY: 1
+
+
+
