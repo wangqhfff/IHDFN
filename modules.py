@@ -5,10 +5,10 @@ from dgllife.model.gnn import GCN
 from GIL import GIL
 from torch.nn.utils.weight_norm import weight_norm
 import math
-# 新加
+
 import numpy as np
 import dgl.nn as dglnn
-# 动态编码相关
+
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 #conv_filters1 = [[1,32],[3,32],[5,64]]
 conv_filters1 = [[1,32],[3,32],[5,64],[7,128]]
@@ -99,69 +99,6 @@ class IHDFN(nn.Module):
 def lambda_init(depth):
     return 0.8 - 0.6 * math.exp(-0.3 * (depth - 1))
 
-# Multi-head Differential Attention
-class MultiHeadDiffAttention(nn.Module):
-    def __init__(self, n_embd, n_head, layer_idx):
-        super().__init__()
-        assert n_embd % n_head == 0
-        self.n_head = n_head
-        self.head_size = n_embd // n_head
-        self.lambda_init = lambda_init(layer_idx)
-
-        # split qkv
-        self.q1_proj = nn.Linear(n_embd, n_embd, bias=False)
-        self.q2_proj = nn.Linear(n_embd, n_embd, bias=False)
-        self.k1_proj = nn.Linear(n_embd, n_embd, bias=False)
-        self.k2_proj = nn.Linear(n_embd, n_embd, bias=False)
-        self.v_proj = nn.Linear(n_embd, 2 * n_embd, bias=False)  # V projects to 2 * n_embd
-
-        self.c_proj = nn.Linear(2 * n_embd, n_embd, bias=False)
-        self.attn_dropout = nn.Dropout(0.2)
-        self.resid_dropout = nn.Dropout(0.2)
-        self.subln = nn.LayerNorm(2 * self.head_size, elementwise_affine=False)
-
-        # Init λ across heads
-        self.lambda_q1 = nn.Parameter(torch.randn(n_head, self.head_size) * 0.1)
-        self.lambda_k1 = nn.Parameter(torch.randn(n_head, self.head_size) * 0.1)
-        self.lambda_q2 = nn.Parameter(torch.randn(n_head, self.head_size) * 0.1)
-        self.lambda_k2 = nn.Parameter(torch.randn(n_head, self.head_size) * 0.1)
-
-    def forward(self, x):
-        B, T, C = x.shape
-
-        # Project x to get q1, q2, k1, k2, v
-        q1 = self.q1_proj(x).view(B, T, self.n_head, self.head_size).transpose(1, 2)
-        q2 = self.q2_proj(x).view(B, T, self.n_head, self.head_size).transpose(1, 2)
-        k1 = self.k1_proj(x).view(B, T, self.n_head, self.head_size).transpose(1, 2)
-        k2 = self.k2_proj(x).view(B, T, self.n_head, self.head_size).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.n_head, 2 * self.head_size).transpose(1, 2)
-
-        scale = 1.0 / math.sqrt(self.head_size)
-        att1 = torch.matmul(q1, k1.transpose(-2, -1)) * scale
-        att2 = torch.matmul(q2, k2.transpose(-2, -1)) * scale
-
-        attn_mask = torch.tril(torch.ones(T, T, device=x.device)).unsqueeze(0).unsqueeze(0)
-        att1 = att1.masked_fill(attn_mask == 0, float('-inf'))
-        att2 = att2.masked_fill(attn_mask == 0, float('-inf'))
-
-        att1 = F.softmax(att1, dim=-1)
-        att2 = F.softmax(att2, dim=-1)
-
-        # Compute λ for each head separately
-        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1)).unsqueeze(-1).unsqueeze(-1)
-        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1)).unsqueeze(-1).unsqueeze(-1)
-        lambda_full = lambda_1 - lambda_2 + self.lambda_init
-
-        att = att1 - lambda_full * att2
-        att = self.attn_dropout(att)
-
-        y = torch.matmul(att, v)  # [B, n_head, T, 2 * head_size]
-        y = self.subln(y)
-        y = y * (1 - self.lambda_init)
-
-        y = y.transpose(1, 2).contiguous().view(B, T, 2 * C)
-        y = self.resid_dropout(self.c_proj(y))
-        return y
 
 # MLP
 class MLP(nn.Module):
@@ -192,42 +129,7 @@ class Block3(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-# Transformer Model
-class nanoGPT(nn.Module):
-    def __init__(self, vocab_size, n_embd, n_head, n_layer, block_size, attention_class):
-        super().__init__()
-        self.block_size = block_size
-        self.transformer = nn.ModuleDict(dict(
-            # wte=nn.Embedding(vocab_size, n_embd),  # 注释掉词汇嵌入层
-            wpe=nn.Embedding(block_size, n_embd),  # 位置嵌入层
-            drop=nn.Dropout(0.1),
-            h=nn.ModuleList([Block3(n_embd, n_head, attention_class, layer_idx=i + 1) for i in range(n_layer)]),
-            ln_f=nn.LayerNorm(n_embd),
-        ))
-        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
-        self.n_layer = n_layer
-        self.n_embd = n_embd
 
-    def forward(self, x, targets=None):
-        # x 现在直接是嵌入矩阵，形状为 [batch_size, length, n_embd]
-        device = x.device
-        b, t, _ = x.size()
-
-        # 生成位置嵌入并加到输入中
-        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)
-        pos_emb = self.transformer.wpe(pos)
-
-        # 加上位置嵌入并应用 dropout
-        x = self.transformer.drop(x + pos_emb)
-
-        # 经过多层 Transformer 层
-        for block in self.transformer.h:
-            x = block(x)  # x 的形状保持为 [batch_size, length, n_embd]
-
-        # 最终特征矩阵
-        x = self.transformer.ln_f(x)
-
-        return x  # 返回特征矩阵
 
 # ————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 # 动态编码
